@@ -26,6 +26,7 @@ import pickle
 import smtplib
 import logging
 import traceback
+import random
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -45,7 +46,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 
 # Parse .env file to collect all SEARCH_QUERY entries and other env vars
@@ -83,6 +84,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# LinkedIn Safety Settings (configurable via .env)
+# These settings help prevent LinkedIn from banning or blocking your account
+DELAY_BETWEEN_POSTS = float(os.getenv('LINKEDIN_DELAY_BETWEEN_POSTS', 3.0))  # seconds between processing posts
+DELAY_BETWEEN_LIKES = float(os.getenv('LINKEDIN_DELAY_BETWEEN_LIKES', 5.0))  # seconds between likes
+DELAY_BETWEEN_SCROLLS = float(os.getenv('LINKEDIN_DELAY_BETWEEN_SCROLLS', 2.0))  # seconds between scrolls
+DELAY_BETWEEN_QUERIES = int(os.getenv('LINKEDIN_DELAY_BETWEEN_QUERIES', 10))  # seconds between search queries
+RANDOM_DELAY_MIN = float(os.getenv('LINKEDIN_RANDOM_DELAY_MIN', 1.0))  # min random delay multiplier
+RANDOM_DELAY_MAX = float(os.getenv('LINKEDIN_RANDOM_DELAY_MAX', 2.0))  # max random delay multiplier
+MAX_LIKES_PER_HOUR = int(os.getenv('LINKEDIN_MAX_LIKES_PER_HOUR', 30))  # max likes per hour (LinkedIn limit ~50/hour)
+MAX_LIKES_PER_DAY = int(os.getenv('LINKEDIN_MAX_LIKES_PER_DAY', 100))  # max likes per day (LinkedIn limit ~200/day)
+MAX_POSTS_PER_HOUR = int(os.getenv('LINKEDIN_MAX_POSTS_PER_HOUR', 50))  # max posts processed per hour
+MAX_POSTS_PER_DAY = int(os.getenv('LINKEDIN_MAX_POSTS_PER_DAY', 200))  # max posts processed per day
+BATCH_SIZE = int(os.getenv('LINKEDIN_BATCH_SIZE', 10))  # posts per batch before break
+BATCH_BREAK_DELAY = int(os.getenv('LINKEDIN_BATCH_BREAK_DELAY', 30))  # seconds break after each batch
+
+print("🔒 LinkedIn Safety Settings:")
+print(f"   ⏱️  Delay between posts: {DELAY_BETWEEN_POSTS}s (with randomization)")
+print(f"   👍 Delay between likes: {DELAY_BETWEEN_LIKES}s")
+print(f"   📜 Delay between scrolls: {DELAY_BETWEEN_SCROLLS}s")
+print(f"   🔍 Delay between queries: {DELAY_BETWEEN_QUERIES}s")
+print(f"   👍 Max likes per hour: {MAX_LIKES_PER_HOUR}")
+print(f"   👍 Max likes per day: {MAX_LIKES_PER_DAY}")
+print(f"   📊 Max posts per hour: {MAX_POSTS_PER_HOUR}")
+print(f"   📊 Max posts per day: {MAX_POSTS_PER_DAY}")
+print(f"   📦 Batch size: {BATCH_SIZE} posts")
+print(f"   ⏸️  Batch break delay: {BATCH_BREAK_DELAY}s")
+print()
+
 class LinkedInEmailScraper:
     def __init__(self, linkedin_email=None, linkedin_password=None, gmail_email=None, gmail_password=None):
         self.driver = None
@@ -103,6 +132,14 @@ class LinkedInEmailScraper:
         self.resume_path = "resume.pdf"  # Default resume path
         self.resume_dir = "resumes"  # Directory for generated resumes
         os.makedirs(self.resume_dir, exist_ok=True)
+        
+        # Rate limiting tracking
+        self.like_times = []  # Track when likes were performed
+        self.post_processing_times = []  # Track when posts were processed
+        self.start_time = datetime.now()
+        self.total_likes_today = 0
+        self.total_posts_processed_today = 0
+        self.account_blocked = False
         
         # Personal details - read from environment variables
         self.name = os.environ.get('YOUR_NAME', 'Your Name')
@@ -943,6 +980,17 @@ class LinkedInEmailScraper:
     def click_like_button(self, post_element):
         """Click the like button on a post"""
         try:
+            # Check for LinkedIn blocking first
+            if self._check_linkedin_block():
+                self.account_blocked = True
+                logger.error("LinkedIn account appears to be blocked - stopping likes")
+                print("\n🚨 LinkedIn account may be blocked - stopping like operations")
+                return False
+            
+            # Check rate limits before liking
+            if not self._check_rate_limits('like'):
+                return False
+            
             # First check if already liked
             if self.is_post_liked(post_element):
                 logger.info("Post is already liked, skipping like action")
@@ -977,13 +1025,23 @@ class LinkedInEmailScraper:
                                 self.driver.execute_script("arguments[0].click();", like_button_via_svg)
                                 logger.info("Clicked like button successfully (via SVG)")
                                 print("Liked the post")
-                                time.sleep(0.5)
+                                # Track like and add delay
+                                self.like_times.append(datetime.now())
+                                self.total_likes_today += 1
+                                delay = self._human_like_delay(DELAY_BETWEEN_LIKES)
+                                logger.debug(f"Waiting {delay:.2f}s before next action...")
+                                time.sleep(delay)
                                 return True
                             except:
                                 like_button_via_svg.click()
                                 logger.info("Clicked like button successfully (via SVG, regular click)")
                                 print("Liked the post")
-                                time.sleep(0.5)
+                                # Track like and add delay
+                                self.like_times.append(datetime.now())
+                                self.total_likes_today += 1
+                                delay = self._human_like_delay(DELAY_BETWEEN_LIKES)
+                                logger.debug(f"Waiting {delay:.2f}s before next action...")
+                                time.sleep(delay)
                                 return True
             except NoSuchElementException:
                 pass
@@ -1021,7 +1079,12 @@ class LinkedInEmailScraper:
                             self.driver.execute_script("arguments[0].click();", like_button)
                             logger.info("Clicked like button successfully (JavaScript click)")
                             print("Liked the post")
-                            time.sleep(0.5)  # Wait for like to register
+                            # Track like and add delay
+                            self.like_times.append(datetime.now())
+                            self.total_likes_today += 1
+                            delay = self._human_like_delay(DELAY_BETWEEN_LIKES)
+                            logger.debug(f"Waiting {delay:.2f}s before next action...")
+                            time.sleep(delay)
                             return True
                         except:
                             # Fallback to regular click
@@ -1029,7 +1092,12 @@ class LinkedInEmailScraper:
                                 like_button.click()
                                 logger.info("Clicked like button successfully (regular click)")
                                 print("Liked the post")
-                                time.sleep(0.5)  # Wait for like to register
+                                # Track like and add delay
+                                self.like_times.append(datetime.now())
+                                self.total_likes_today += 1
+                                delay = self._human_like_delay(DELAY_BETWEEN_LIKES)
+                                logger.debug(f"Waiting {delay:.2f}s before next action...")
+                                time.sleep(delay)
                                 return True
                             except Exception as e:
                                 logger.debug(f"Both click methods failed: {e}")
@@ -1054,6 +1122,113 @@ class LinkedInEmailScraper:
             'connection', 'refused', 'maxretry', 'timeout', 'no such window', 
             'session', 'target machine actively refused', 'winerror 10061'
         ])
+    
+    def _is_linkedin_rate_limit_error(self, error):
+        """Check if error indicates LinkedIn rate limiting or blocking"""
+        error_str = str(error).lower()
+        page_source = ""
+        try:
+            page_source = self.driver.page_source.lower()
+        except:
+            pass
+        
+        rate_limit_keywords = [
+            'rate limit', 'too many requests', 'temporarily blocked',
+            'account restricted', 'suspicious activity', 'verify your identity',
+            'challenge', 'captcha', 'unusual activity', 'security check',
+            'temporarily unavailable', 'try again later', '429', '503'
+        ]
+        
+        return any(keyword in error_str or keyword in page_source for keyword in rate_limit_keywords)
+    
+    def _check_linkedin_block(self):
+        """Check if LinkedIn has blocked or restricted the account"""
+        try:
+            page_source = self.driver.page_source.lower()
+            current_url = self.driver.current_url.lower()
+            
+            # Check for common blocking indicators
+            block_indicators = [
+                'account restricted', 'suspicious activity', 'verify your identity',
+                'challenge', 'security check', 'unusual activity', 'temporarily blocked',
+                'account temporarily unavailable', 'access denied'
+            ]
+            
+            for indicator in block_indicators:
+                if indicator in page_source:
+                    logger.error(f"LinkedIn blocking detected: {indicator}")
+                    print(f"\n⚠️  WARNING: LinkedIn may have restricted your account!")
+                    print(f"   Detected: {indicator}")
+                    print(f"   Current URL: {current_url}")
+                    return True
+            
+            # Check URL for challenge/verification pages
+            if 'challenge' in current_url or 'verify' in current_url or 'security' in current_url:
+                logger.error(f"LinkedIn challenge/verification page detected: {current_url}")
+                print(f"\n⚠️  WARNING: LinkedIn is requesting verification!")
+                print(f"   URL: {current_url}")
+                return True
+                
+            return False
+        except Exception as e:
+            logger.debug(f"Error checking LinkedIn block status: {e}")
+            return False
+    
+    def _human_like_delay(self, base_delay):
+        """Add randomized delay to make behavior more human-like"""
+        random_multiplier = random.uniform(RANDOM_DELAY_MIN, RANDOM_DELAY_MAX)
+        delay = base_delay * random_multiplier
+        # Add small random jitter
+        jitter = random.uniform(0, 0.5)
+        return delay + jitter
+    
+    def _check_rate_limits(self, action_type='like'):
+        """Check if rate limits are exceeded for an action"""
+        current_time = datetime.now()
+        
+        if action_type == 'like':
+            # Remove likes older than 1 hour
+            self.like_times = [t for t in self.like_times if (current_time - t).total_seconds() < 3600]
+            
+            # Check hourly limit
+            if len(self.like_times) >= MAX_LIKES_PER_HOUR:
+                wait_time = 3600 - (current_time - self.like_times[0]).total_seconds()
+                logger.warning(f"Hourly like limit reached ({MAX_LIKES_PER_HOUR}). Waiting {int(wait_time)}s...")
+                print(f"\n⚠️  Hourly like limit reached ({MAX_LIKES_PER_HOUR})")
+                print(f"⏸️  Waiting {int(wait_time)} seconds before continuing...")
+                time.sleep(wait_time)
+                self.like_times = []  # Reset after wait
+            
+            # Check daily limit
+            hours_elapsed = (current_time - self.start_time).total_seconds() / 3600
+            if hours_elapsed < 24 and self.total_likes_today >= MAX_LIKES_PER_DAY:
+                logger.warning(f"Daily like limit reached ({MAX_LIKES_PER_DAY})")
+                print(f"\n⚠️  Daily like limit reached ({MAX_LIKES_PER_DAY})")
+                print(f"⏸️  Please run again tomorrow or increase MAX_LIKES_PER_DAY in .env")
+                return False
+        
+        elif action_type == 'post':
+            # Remove processing times older than 1 hour
+            self.post_processing_times = [t for t in self.post_processing_times if (current_time - t).total_seconds() < 3600]
+            
+            # Check hourly limit
+            if len(self.post_processing_times) >= MAX_POSTS_PER_HOUR:
+                wait_time = 3600 - (current_time - self.post_processing_times[0]).total_seconds()
+                logger.warning(f"Hourly post processing limit reached ({MAX_POSTS_PER_HOUR}). Waiting {int(wait_time)}s...")
+                print(f"\n⚠️  Hourly post limit reached ({MAX_POSTS_PER_HOUR})")
+                print(f"⏸️  Waiting {int(wait_time)} seconds before continuing...")
+                time.sleep(wait_time)
+                self.post_processing_times = []  # Reset after wait
+            
+            # Check daily limit
+            hours_elapsed = (current_time - self.start_time).total_seconds() / 3600
+            if hours_elapsed < 24 and self.total_posts_processed_today >= MAX_POSTS_PER_DAY:
+                logger.warning(f"Daily post processing limit reached ({MAX_POSTS_PER_DAY})")
+                print(f"\n⚠️  Daily post limit reached ({MAX_POSTS_PER_DAY})")
+                print(f"⏸️  Please run again tomorrow or increase MAX_POSTS_PER_DAY in .env")
+                return False
+        
+        return True
     
     def _wait_for_posts_to_load(self, current_post_count, max_wait_seconds=10):
         """
@@ -1198,7 +1373,6 @@ class LinkedInEmailScraper:
         scroll_attempts = 0
         max_scroll_attempts = 200  # Increased limit for more scrolling
         max_posts_to_process = self.max_posts_to_process  # Maximum posts to process (from .env)
-        posts_per_batch = 10  # Check batches of 10 posts
         posts_checked_in_batch = 0
         emails_found_in_batch = 0
         total_emails_sent = 0
@@ -1207,8 +1381,22 @@ class LinkedInEmailScraper:
         
         while scroll_attempts < max_scroll_attempts:
             try:
-                # Wait a bit for page to load
-                time.sleep(2)
+                # Check for LinkedIn blocking
+                if self._check_linkedin_block():
+                    self.account_blocked = True
+                    logger.error("LinkedIn account appears to be blocked - stopping processing")
+                    print("\n🚨 LinkedIn account may be blocked - stopping operations")
+                    break
+                
+                # Check rate limits for post processing
+                if not self._check_rate_limits('post'):
+                    logger.warning("Rate limit reached for post processing - stopping")
+                    print("\n⚠️  Rate limit reached - stopping post processing")
+                    break
+                
+                # Wait a bit for page to load (with randomization)
+                delay = self._human_like_delay(2.0)
+                time.sleep(delay)
                 
                 # Find all post containers - try multiple selectors (for both feed and search results)
                 # Note: LinkedIn search results show posts in a different structure than feed
@@ -1368,12 +1556,22 @@ class LinkedInEmailScraper:
                         processed_posts.add(post_id)
                         new_posts_processed += 1
                         posts_checked_in_batch += 1
+                        self.total_posts_processed_today += 1
+                        self.post_processing_times.append(datetime.now())
                         
                         logger.debug(f"Processing new post: {post_id} ({len(processed_posts)}/{max_posts_to_process})")
+                        
+                        # Add delay between posts (with randomization)
+                        if len(processed_posts) > 1:
+                            delay = self._human_like_delay(DELAY_BETWEEN_POSTS)
+                            logger.debug(f"Waiting {delay:.2f}s before processing next post...")
+                            time.sleep(delay)
                         
                         # Scroll to post to ensure it's visible
                         try:
                             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", post)
+                            # Small delay after scrolling
+                            time.sleep(self._human_like_delay(0.5))
                         except Exception as e:
                             if self._is_browser_connection_error(e):
                                 logger.error(f"Scrolling to post failed due to browser connection error: {e}")
@@ -1546,14 +1744,28 @@ class LinkedInEmailScraper:
                     print(f"\nReached maximum limit of {max_posts_to_process} posts - stopping")
                     break
                 
-                # Check if we've checked a batch of 10 posts
-                if posts_checked_in_batch >= posts_per_batch:
+                # Check if we've checked a batch of posts
+                if posts_checked_in_batch >= BATCH_SIZE:
                     print(f"\n--- Checked {posts_checked_in_batch} posts in this batch ---")
                     print(f"Emails found: {emails_found_in_batch}, Emails sent: {total_emails_sent}")
+                    print(f"Likes today: {self.total_likes_today}/{MAX_LIKES_PER_DAY}")
+                    print(f"Posts processed today: {self.total_posts_processed_today}/{MAX_POSTS_PER_DAY}")
+                    
+                    # Take a break after each batch
+                    print(f"⏸️  Taking a {BATCH_BREAK_DELAY}s break after batch...")
+                    logger.info(f"Batch complete - taking {BATCH_BREAK_DELAY}s break")
+                    time.sleep(BATCH_BREAK_DELAY)
+                    
+                    # Check for blocking again after break
+                    if self._check_linkedin_block():
+                        self.account_blocked = True
+                        logger.error("LinkedIn account appears to be blocked - stopping processing")
+                        print("\n🚨 LinkedIn account may be blocked - stopping operations")
+                        break
                     
                     # If no emails found in this batch, continue to next batch
                     if emails_found_in_batch == 0:
-                        print("No emails found in this batch - moving to next 10 posts...")
+                        print("No emails found in this batch - moving to next batch...")
                         logger.info(f"No emails found in batch of {posts_checked_in_batch} posts - continuing")
                     else:
                         # Reset batch counter for next batch
@@ -1597,6 +1809,8 @@ class LinkedInEmailScraper:
                 
                 # Scroll down to load more posts - try multiple scrolling methods
                 logger.debug("Scrolling to load more posts...")
+                # Add delay before scrolling
+                time.sleep(self._human_like_delay(DELAY_BETWEEN_SCROLLS))
                 try:
                     # Get current scroll position and page dimensions
                     current_scroll = self.driver.execute_script("return window.pageYOffset || window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;")
@@ -1835,9 +2049,19 @@ class LinkedInEmailScraper:
                     logger.error(traceback.format_exc())
                     print(f"\n[ERROR] Browser connection lost - will move to next SEARCH_QUERY")
                     raise  # Re-raise to be caught by run() method
+                elif self._is_linkedin_rate_limit_error(e):
+                    logger.error(f"LinkedIn rate limit detected: {e}")
+                    print(f"\n⚠️  LinkedIn rate limit detected - stopping operations")
+                    print(f"   Please wait before running again")
+                    self.account_blocked = True
+                    break
                 else:
                     logger.error(f"Error in process_posts loop: {e}")
                     logger.error(traceback.format_exc())
+                    # Check for blocking after error
+                    if self._check_linkedin_block():
+                        self.account_blocked = True
+                        break
                     break
         
         print(f"\n=== Processing Summary ===")
@@ -1846,7 +2070,14 @@ class LinkedInEmailScraper:
         emails_sent = sum(1 for p in self.posts_data if p.get('email_sent', False))
         print(f"Posts with emails found: {posts_with_email}")
         print(f"Emails sent successfully: {emails_sent}")
-        logger.info(f"Processing complete. Total posts: {len(processed_posts)}, Posts with emails: {posts_with_email}, Emails sent: {emails_sent}")
+        print(f"\n=== Rate Limiting Stats ===")
+        print(f"Likes performed: {self.total_likes_today}/{MAX_LIKES_PER_DAY} (daily limit)")
+        print(f"Posts processed: {self.total_posts_processed_today}/{MAX_POSTS_PER_DAY} (daily limit)")
+        if self.account_blocked:
+            print(f"⚠️  Account status: BLOCKED/RESTRICTED - Please check LinkedIn")
+        else:
+            print(f"✅ Account status: OK")
+        logger.info(f"Processing complete. Total posts: {len(processed_posts)}, Posts with emails: {posts_with_email}, Emails sent: {emails_sent}, Likes: {self.total_likes_today}, Account blocked: {self.account_blocked}")
     
     def extract_keywords_from_post(self, post_content):
         """Extract relevant keywords and skills from post content"""
@@ -2513,10 +2744,19 @@ Warm regards,
                     print(f"  Emails found: {query_emails}")
                     print(f"  Emails sent: {query_sent}")
                     
-                    # Small delay between queries
+                    # Delay between queries (with randomization)
                     if query_idx < len(self.search_queries):
-                        print(f"\nWaiting 3 seconds before next query...")
-                        time.sleep(3)
+                        delay = self._human_like_delay(DELAY_BETWEEN_QUERIES)
+                        print(f"\nWaiting {delay:.2f} seconds before next query...")
+                        logger.info(f"Waiting {delay:.2f}s before next query (rate limiting)")
+                        time.sleep(delay)
+                        
+                        # Check for blocking before next query
+                        if self._check_linkedin_block():
+                            self.account_blocked = True
+                            logger.error("LinkedIn account appears to be blocked - stopping")
+                            print("\n🚨 LinkedIn account may be blocked - stopping all operations")
+                            break
                         
                 except Exception as e:
                     logger.error(f"Error processing query '{search_query}': {e}")
@@ -2536,6 +2776,15 @@ Warm regards,
             print(f"Total emails found: {total_emails_found}")
             print(f"Total emails sent: {total_emails_sent}")
             print(f"Emails saved to: emails.txt")
+            print(f"\n=== Safety & Rate Limiting ===")
+            print(f"Total likes performed: {self.total_likes_today}/{MAX_LIKES_PER_DAY} (daily limit)")
+            print(f"Total posts processed: {self.total_posts_processed_today}/{MAX_POSTS_PER_DAY} (daily limit)")
+            if self.account_blocked:
+                print(f"⚠️  WARNING: LinkedIn account may be BLOCKED/RESTRICTED")
+                print(f"   Please check your LinkedIn account manually")
+                print(f"   Wait before running the script again")
+            else:
+                print(f"✅ Account status: OK - No blocking detected")
             print(f"{'='*60}\n")
             
             # Note: Emails are now sent immediately during processing
